@@ -71,19 +71,44 @@ def get_jerk_factor(personality=custom.LongitudinalPersonalitySP.standard):
 
 def get_T_FOLLOW(personality=custom.LongitudinalPersonalitySP.standard):
   if personality==custom.LongitudinalPersonalitySP.relaxed:
-    return 1.75
+    return 2.95
   elif personality==custom.LongitudinalPersonalitySP.standard:
-    return 1.45
+    return 2.45
   elif personality==custom.LongitudinalPersonalitySP.moderate:
-    return 1.25
+    return 1.65
   elif personality==custom.LongitudinalPersonalitySP.aggressive:
-    return 1.0
+    return 1.25
   else:
     raise NotImplementedError("Longitudinal personality not supported")
+# added 2024.02.10
+def get_dynamic_follow(v_ego, personality=custom.LongitudinalPersonalitySP.standard):
+  if personality==custom.LongitudinalPersonalitySP.relaxed:
+    x_vel =  [0.0,  5.55,  19.99, 20,   25,   40]
+    y_dist = [1.35,  1.55,   1.55,   1.8,  1.95, 2.75]
+  elif personality==custom.LongitudinalPersonalitySP.standard:
+    x_vel =  [0.0,  5.55,  19.99, 20,   25,   40]
+    y_dist = [1.35,  1.55,  1.55,  1.7,  1.8,  2.45]
+  elif personality==custom.LongitudinalPersonalitySP.aggressive:
+    x_vel =  [0.0,  2.0,   5.55,  19.99, 20,    25,   40]
+    y_dist = [1.0,  1.0,   1.08,  1.105,  1.11,  1.11, 1.2]
+  else:
+    raise NotImplementedError("Dynamic Follow personality not supported")
+  return np.interp(v_ego, x_vel, y_dist)
 
 def get_stopped_equivalence_factor(v_lead):
   return (v_lead**2) / (2 * COMFORT_BRAKE)
+# added 2024.02.10
 
+def get_stopped_equivalence_factor_krkeegen(v_lead, v_ego):
+  # KRKeegan this offset rapidly decreases the following distance when the lead pulls
+  # away, resulting in an early demand for acceleration.
+  v_diff_offset = 0
+  if np.all(v_lead - v_ego > 0):
+    v_diff_offset = ((v_lead - v_ego) * 1.)
+    v_diff_offset = np.clip(v_diff_offset, 0, STOP_DISTANCE / 2)
+    v_diff_offset = np.maximum(v_diff_offset * ((10 - v_ego)/10), 0)
+  distance = (v_lead**2) / (2 * COMFORT_BRAKE) + v_diff_offset
+  return distance
 def get_safe_obstacle_distance(v_ego, t_follow):
   return (v_ego**2) / (2 * COMFORT_BRAKE) + t_follow * v_ego + STOP_DISTANCE
 
@@ -336,19 +361,42 @@ class LongitudinalMpc:
     self.cruise_min_a = min_a
     self.max_a = max_a
 
-  def update(self, radarstate, v_cruise, x, v, a, j, personality=custom.LongitudinalPersonalitySP.standard):
-    t_follow = get_T_FOLLOW(personality)
+#  def update(self, radarstate, v_cruise, x, v, a, j, personality=custom.LongitudinalPersonalitySP.standard):
+#    t_follow = get_T_FOLLOW(personality)
+#    v_ego = self.x0[1]
+#    self.status = radarstate.leadOne.status or radarstate.leadTwo.status
+#
+#    lead_xv_0 = self.process_lead(radarstate.leadOne)
+#    lead_xv_1 = self.process_lead(radarstate.leadTwo)
+#
+# added 2024.02.10
+
+  def update(self, radarstate, v_cruise, x, v, a, j, personality=custom.LongitudinalPersonalitySP.standard, use_df_tune=False, use_krkeegen_tune=True, smoother_braking=True):
+    # t_follow = get_T_FOLLOW(personality)
     v_ego = self.x0[1]
+    t_follow = get_T_FOLLOW(personality) if not use_df_tune else get_dynamic_follow(v_ego, personality)
     self.status = radarstate.leadOne.status or radarstate.leadTwo.status
 
     lead_xv_0 = self.process_lead(radarstate.leadOne)
     lead_xv_1 = self.process_lead(radarstate.leadTwo)
 
+    if smoother_braking:
+      distance_factor = np.maximum(1, lead_xv_0[:,0] - (lead_xv_0[:,1] * t_follow))
+      t_follow_offset = np.clip((v_ego - lead_xv_0[:,1]) - COMFORT_BRAKE, 1, distance_factor)
+      t_follow = t_follow / t_follow_offset
+
+
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
     # and then treat that as a stopped car/obstacle at this new distance.
-    lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
-    lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
+# added 2024.02.10   
+
+    if use_krkeegen_tune:
+      lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor_krkeegen(lead_xv_0[:,1], v_ego)
+      lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor_krkeegen(lead_xv_1[:,1], v_ego)
+    else:
+      lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
+      lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
 
     cruise_target_e2ex = T_IDXS * np.clip(v_cruise, v_ego - 2.0, 1e3) + x[0]
     e2e_xforward = ((v[1:] + v[:-1]) / 2) * (T_IDXS[1:] - T_IDXS[:-1])
